@@ -6,26 +6,22 @@ import io
 import fitz  # PyMuPDF
 from PIL import Image
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Universal Extractor", page_icon="📊", layout="wide")
-st.title("📊 Extracteur Universel (Ligne par Ligne)")
+st.set_page_config(page_title="Expense Extractor", page_icon="🧾", layout="wide")
+st.title("🧾 Extracteur Robuste (Anti-Crash)")
 
 # --- GESTION CLÉ API ---
 try:
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
-        status = "✅ Clé Sécurisée"
+        status = "✅ Clé Secrets"
     else:
-        api_key = st.sidebar.text_input("Clé API Gemini", type="password")
+        api_key = st.sidebar.text_input("Clé API Gemini", type="password").strip()
         status = "⚠️ Clé Manuelle"
 except:
-    api_key = st.sidebar.text_input("Clé API Gemini", type="password")
+    api_key = st.sidebar.text_input("Clé API Gemini", type="password").strip()
     status = "⚠️ Clé Manuelle"
 
-with st.sidebar:
-    st.info(f"Status : {status}")
-    st.markdown("---")
-    st.write("Cet outil détecte automatiquement s'il faut extraire une liste de produits ou juste un total.")
+st.sidebar.info(f"Status : {status}")
 
 # --- FONCTIONS ---
 def pdf_to_images(pdf_bytes):
@@ -37,147 +33,108 @@ def pdf_to_images(pdf_bytes):
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
-def analyze_universal(image, key):
+def analyze_smart(image, key):
     genai.configure(api_key=key)
-    # Le modèle Pro est parfois meilleur pour les longs tableaux, mais Flash est plus rapide.
-    # On reste sur Flash pour la gratuité/vitesse, il est très capable.
-    model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # --- PROMPT UNIVERSEL ---
+    # LISTE DE SECOURS : On essaie ces noms l'un après l'autre
+    # Si le 1er plante (404), on prend le 2ème, etc.
+    models_to_try = [
+        'gemini-1.5-flash',          # Nom standard
+        'gemini-1.5-flash-latest',   # Alias parfois requis
+        'gemini-1.5-flash-001',      # Version numérotée (souvent la plus stable)
+        'gemini-1.5-pro',            # Version Pro (plus lente mais puissante)
+        'gemini-pro'                 # Vieux modèle (valeur sûre)
+    ]
+    
     prompt = """
-    Tu es un assistant comptable automatisé. Ton but est de structurer les données de ce document (facture, reçu, ticket).
-    
-    Règles d'extraction :
-    1. Identifie les métadonnées globales (Date, Vendeur, Devise).
-    2. Identifie le CONTENU de l'achat :
-       - CAS A (Ticket détaillé, Facture matériel, Supermarché, Resto avec menu) : Extrais CHAQUE ligne de produit/service individuellement.
-       - CAS B (Ticket global, Taxi, Petit reçu CB) : Si aucun détail n'est listé, crée une seule ligne résumant le service (ex: "Trajet Uber", "Repas", "Divers").
-    
-    Format de sortie attendu (JSON STRICT UNIQUEMENT) :
+    Analyse ce document comptable. Renvoie un JSON strict :
     {
         "date": "YYYY-MM-DD",
-        "merchant": "Nom de l'entreprise",
-        "currency": "Symbole (€, £, $)",
-        "category": "Catégorie suggérée (Transport, Alimentation, Tech, Services, etc.)",
+        "merchant": "Nom",
+        "category": "Catégorie",
+        "currency": "Symbole",
         "items": [
-            {
-                "description": "Nom précis du produit ou service sur la ligne",
-                "quantity": 1 (par défaut 1 si non précisé),
-                "price": 0.00 (Prix total de la ligne TTC)
-            }
+            {"description": "Nom produit", "quantity": 1, "price": 0.00}
         ]
     }
-    
-    Attention :
-    - Ne pas inventer de données. Si une info manque, mets null ou une chaine vide.
-    - Les frais de service, livraison ou pourboires doivent être des lignes ("items") séparées.
-    - Le total des prix des "items" doit correspondre au total du document.
+    Si items impossibles à distinguer, fais une ligne globale.
     """
     
-    try:
-        response = model.generate_content([prompt, image])
-        clean_json = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        return {"error": str(e)}
+    last_error = ""
+    
+    for model_name in models_to_try:
+        try:
+            # On tente le modèle
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([prompt, image])
+            
+            # Si on arrive ici, c'est que ça a marché !
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_json)
+            
+        except Exception as e:
+            # Si ça plante, on note l'erreur et on continue la boucle
+            last_error = str(e)
+            continue 
 
-# --- UI PRINCIPALE ---
-uploaded_files = st.file_uploader("Dépose tes factures / reçus", 
-                                  type=['png', 'jpg', 'jpeg', 'pdf', 'webp'], 
-                                  accept_multiple_files=True)
+    # Si on sort de la boucle, c'est que TOUS les modèles ont échoué
+    return {"error": f"Échec total. Dernier message: {last_error}"}
 
-if st.button("Lancer l'analyse 🚀") and uploaded_files:
+# --- UI ---
+uploaded_files = st.file_uploader("Fichiers (PDF/IMG)", type=['png', 'jpg', 'pdf'], accept_multiple_files=True)
+
+if st.button("Lancer") and uploaded_files:
     if not api_key:
-        st.error("Il manque la clé API !")
+        st.error("Clé manquante")
         st.stop()
         
-    all_extracted_rows = []
-    progress_bar = st.progress(0)
+    all_data = []
+    bar = st.progress(0)
     
     for idx, file in enumerate(uploaded_files):
         try:
-            # 1. Préparation des images
-            images_to_process = []
-            if file.type == "application/pdf":
-                images_to_process = pdf_to_images(file.read())
-            else:
-                images_to_process = [Image.open(file)]
+            images = pdf_to_images(file.read()) if file.type == "application/pdf" else [Image.open(file)]
             
-            # 2. Boucle sur chaque page/image
-            for img in images_to_process:
-                data = analyze_universal(img, api_key)
+            for img in images:
+                data = analyze_smart(img, api_key) # On utilise la fonction intelligente
                 
-                # Vérification d'erreur API
                 if "error" in data:
-                    st.warning(f"Erreur sur {file.name} : {data['error']}")
-                    continue
-                
-                # 3. Aplatissement du JSON vers Excel
-                meta_date = data.get("date")
-                meta_merchant = data.get("merchant")
-                meta_currency = data.get("currency")
-                meta_category = data.get("category")
-                
-                # Si l'IA trouve des items, on crée une ligne par item
-                if "items" in data and isinstance(data["items"], list) and len(data["items"]) > 0:
-                    for item in data["items"]:
-                        new_row = {
-                            "Date": meta_date,
-                            "Vendeur": meta_merchant,
-                            "Catégorie": meta_category,
-                            "Description": item.get("description", "Non spécifié"),
-                            "Quantité": item.get("quantity", 1),
-                            "Montant": item.get("price", 0.0),
-                            "Devise": meta_currency,
-                            "Fichier Source": file.name
-                        }
-                        all_extracted_rows.append(new_row)
+                    st.error(f"Erreur sur {file.name}: {data['error']}")
                 else:
-                    # Fallback de sécurité : Si l'IA renvoie une structure vide ou bizarre
-                    # On essaie de récupérer au moins un total global s'il existe ailleurs dans le JSON
-                    # (Dépend de la flexibilité du modèle, mais ici on sécurise le code Python)
-                    new_row = {
-                        "Date": meta_date,
-                        "Vendeur": meta_merchant,
-                        "Catégorie": meta_category,
-                        "Description": "Dépense globale (Détail non extrait)",
-                        "Quantité": 1,
-                        "Montant": 0.0, # À corriger manuellement si échec
-                        "Devise": meta_currency,
-                        "Fichier Source": file.name
-                    }
-                    all_extracted_rows.append(new_row)
-
+                    # Traitement des données réussies
+                    merchant = data.get("merchant", "")
+                    date = data.get("date", "")
+                    currency = data.get("currency", "")
+                    category = data.get("category", "")
+                    
+                    if "items" in data and data["items"]:
+                        for item in data["items"]:
+                            all_data.append({
+                                "Date": date, "Enseigne": merchant, "Catégorie": category,
+                                "Description": item.get("description"), "Prix": item.get("price"),
+                                "Devise": currency, "Fichier": file.name
+                            })
+                    else:
+                        all_data.append({
+                            "Date": date, "Enseigne": merchant, "Catégorie": category,
+                            "Description": "Total", "Prix": 0,
+                            "Devise": currency, "Fichier": file.name
+                        })
         except Exception as e:
-            st.error(f"Crash critique sur {file.name}: {e}")
+            st.error(f"Erreur fichier {file.name}: {str(e)}")
+                    
+        bar.progress((idx+1)/len(uploaded_files))
         
-        progress_bar.progress((idx + 1) / len(uploaded_files))
-
-    # --- AFFICHAGE & EXPORT ---
-    if all_extracted_rows:
-        df = pd.DataFrame(all_extracted_rows)
+    if all_data:
+        df = pd.DataFrame(all_data)
+        st.success("Extraction réussie !")
+        st.data_editor(df, use_container_width=True)
         
-        st.success(f"Terminé ! {len(df)} lignes générées.")
-        st.info("Tu peux modifier les descriptions ou montants directement dans le tableau avant d'exporter.")
-        
-        # Tableau interactif
-        edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
-        
-        # Génération Excel
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            edited_df.to_excel(writer, index=False, sheet_name='Export_Frais')
-            
-            # Formatage automatique des colonnes
-            worksheet = writer.sheets['Export_Frais']
-            for i, col in enumerate(edited_df.columns):
+            df.to_excel(writer, index=False, sheet_name='Export')
+            worksheet = writer.sheets['Export']
+            for i, col in enumerate(df.columns):
                 worksheet.set_column(i, i, 20)
                 
-        st.download_button(
-            label="📥 Télécharger le fichier Excel (.xlsx)",
-            data=buffer.getvalue(),
-            file_name="ma_compta_detaillee.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.warning("Aucune donnée n'a pu être extraite.")
+        st.download_button("📥 Télécharger Excel", data=buffer.getvalue(), file_name="export_final.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
